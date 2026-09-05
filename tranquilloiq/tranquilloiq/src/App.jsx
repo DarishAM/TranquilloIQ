@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, Line } from "recharts";
+import { useState, useRef } from "react";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import Papa from "papaparse";
 
 // ── Fonts ──────────────────────────────────────────────────────────────
@@ -46,20 +46,71 @@ const CSV_TEMPLATES = {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────
+const fmtGBP = (n) =>
+  n >= 1000000 ? `£${(n / 1000000).toFixed(2)}M`
+  : n >= 1000 ? `£${(n / 1000).toFixed(0)}k`
+  : `£${Math.round(n)}`;
+
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+// Percentage change between the two most recent periods, or null when the
+// data has no second period to compare against. Deltas are only ever shown
+// when they were actually measured — never assumed.
+function periodDelta(rows, key) {
+  if (rows.length < 2) return null;
+  const prev = num(rows[rows.length - 2][key]);
+  const curr = num(rows[rows.length - 1][key]);
+  if (prev === 0) return null;
+  const pct = ((curr - prev) / Math.abs(prev)) * 100;
+  return { delta: `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`, up: pct >= 0 };
+}
+
 function calcKPIs(revData, deptData) {
-  const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
-  const totalProfit = revData.reduce((s, r) => s + (Number(r.profit) || 0), 0);
+  const totalRev = revData.reduce((s, r) => s + num(r.revenue), 0);
+  const totalProfit = revData.reduce((s, r) => s + num(r.profit), 0);
   const margin = totalRev > 0 ? ((totalProfit / totalRev) * 100).toFixed(1) : "0.0";
-  const totalCost = deptData.reduce((s, d) => s + (Number(d.cost) || 0), 0);
-  const avgEff = deptData.length > 0
-    ? (deptData.reduce((s, d) => s + (Number(d.efficiency) || 0), 0) / deptData.length).toFixed(0)
-    : "0";
-  const fmt = (n) => n >= 1000000 ? `£${(n / 1000000).toFixed(2)}M` : n >= 1000 ? `£${(n / 1000).toFixed(0)}k` : `£${n}`;
+  const totalCost = deptData.reduce((s, d) => s + num(d.cost), 0);
+  const totalHeads = deptData.reduce((s, d) => s + num(d.headcount), 0);
+  const effs = deptData.map((d) => num(d.efficiency));
+  const avgEff = effs.length ? Math.round(effs.reduce((s, e) => s + e, 0) / effs.length) : 0;
+
+  const revDelta = periodDelta(revData, "revenue");
+
+  // Margin moves in percentage points, not percent — compare the last two periods.
+  let marginDelta = null;
+  if (revData.length >= 2) {
+    const [a, b] = revData.slice(-2);
+    const mA = num(a.revenue) ? (num(a.profit) / num(a.revenue)) * 100 : null;
+    const mB = num(b.revenue) ? (num(b.profit) / num(b.revenue)) * 100 : null;
+    if (mA !== null && mB !== null) {
+      const pp = mB - mA;
+      marginDelta = { delta: `${pp >= 0 ? "+" : ""}${pp.toFixed(1)}pp`, up: pp >= 0 };
+    }
+  }
+
+  const last = revData[revData.length - 1];
+  const period = last ? String(last.month ?? last[Object.keys(last)[0]] ?? "latest") : "latest";
+  const costPerHead = totalHeads > 0 ? (totalCost * 1000000) / totalHeads : 0;
+
   return [
-    { label: "Total Revenue", value: fmt(totalRev), delta: "+18.4%", up: true, sub: "from uploaded data" },
-    { label: "Net Profit Margin", value: `${margin}%`, delta: "+4.1pp", up: true, sub: "industry avg 22%" },
-    { label: "Dept Operating Cost", value: `£${totalCost.toFixed(1)}M`, delta: "-3.2%", up: true, sub: "combined dept cost" },
-    { label: "Avg Efficiency", value: `${avgEff}%`, delta: "+9pts", up: Number(avgEff) >= 80, sub: "across all depts" },
+    {
+      label: "Total Revenue", value: fmtGBP(totalRev),
+      ...(revDelta || {}),
+      sub: revDelta ? `${period} vs prior period` : `${revData.length} period${revData.length === 1 ? "" : "s"}`,
+    },
+    {
+      label: "Net Profit Margin", value: `${margin}%`,
+      ...(marginDelta || {}),
+      sub: marginDelta ? `${period} vs prior period` : "across all periods",
+    },
+    {
+      label: "Dept Operating Cost", value: `£${totalCost.toFixed(1)}M`,
+      sub: totalHeads > 0 ? `${fmtGBP(costPerHead)} per head · ${totalHeads} staff` : `${deptData.length} departments`,
+    },
+    {
+      label: "Avg Efficiency", value: `${avgEff}%`,
+      sub: effs.length ? `range ${Math.min(...effs)}%–${Math.max(...effs)}% across ${effs.length} depts` : "no department data",
+    },
   ];
 }
 
@@ -83,26 +134,52 @@ async function generateAIReport(type, revData, deptData, setter) {
 
   setter("loading");
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch("/api/generate-report", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: prompts[type] }],
-      }),
+      body: JSON.stringify({ prompt: prompts[type] }),
     });
-    const data = await res.json();
-    setter(data.content?.find(b => b.type === "text")?.text || "Unable to generate.");
-  } catch {
-    setter("Error generating report. Please try again.");
+
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null);
+      setter(`Could not generate this report. ${detail?.error || `Server returned ${res.status}.`}`);
+      return;
+    }
+
+    // The endpoint streams plain text — paint it as it arrives.
+    const reader = res.body?.getReader();
+    if (!reader) {
+      setter((await res.text()) || "Unable to generate.");
+      return;
+    }
+    const decoder = new TextDecoder();
+    let out = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += decoder.decode(value, { stream: true });
+      setter(out);
+    }
+    out += decoder.decode();
+    setter(out.trim() || "Unable to generate.");
+  } catch (err) {
+    setter(`Error generating report: ${err.message || "network failure"}. Please try again.`);
   }
 }
 
 // ── PDF Export ─────────────────────────────────────────────────────────
+// Report text and CSV cells are user/model supplied, so everything
+// interpolated into the print window gets escaped.
+const esc = (v) =>
+  String(v ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
 function exportPDF(reportTitle, reportText, kpis, revData) {
   const win = window.open("", "_blank");
-  const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+  if (!win) {
+    alert("Your browser blocked the report window. Allow pop-ups for this site and try again.");
+    return;
+  }
   win.document.write(`<!DOCTYPE html><html><head><title>TranquilloIQ Report</title>
   <style>
     body { font-family: Georgia, serif; max-width: 720px; margin: 40px auto; color: #1a1a2e; line-height: 1.8; }
@@ -120,19 +197,19 @@ function exportPDF(reportTitle, reportText, kpis, revData) {
     .footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid #ddd; font-size: 11px; color: #aaa; font-family: monospace; }
     @media print { button { display: none; } }
   </style></head><body>
-  <h1>TranquilloIQ · ${reportTitle}</h1>
+  <h1>TranquilloIQ · ${esc(reportTitle)}</h1>
   <div class="meta">Generated ${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })} · TranquilloIQ AI Engine · Confidential</div>
   <h2>Key Performance Indicators</h2>
   <div class="kpi-grid">
-    ${kpis.map(k => `<div class="kpi"><div class="kpi-val">${k.value}</div><div class="kpi-label">${k.label} <span style="color:${k.up?"#4caf7d":"#e05a5a"}">${k.delta}</span></div></div>`).join("")}
+    ${kpis.map(k => `<div class="kpi"><div class="kpi-val">${esc(k.value)}</div><div class="kpi-label">${esc(k.label)}${k.delta ? ` <span style="color:${k.up ? "#4caf7d" : "#e05a5a"}">${esc(k.delta)}</span>` : ""}</div><div class="kpi-label">${esc(k.sub)}</div></div>`).join("")}
   </div>
   <h2>Revenue Data</h2>
   <table class="table">
     <tr><th>Period</th><th>Revenue</th><th>Target</th><th>Profit</th></tr>
-    ${revData.slice(0,12).map(r => `<tr><td>${r.month||r[Object.keys(r)[0]]}</td><td>£${Number(r.revenue||0).toLocaleString()}</td><td>£${Number(r.target||0).toLocaleString()}</td><td>£${Number(r.profit||0).toLocaleString()}</td></tr>`).join("")}
+    ${revData.slice(0,12).map(r => `<tr><td>${esc(r.month ?? r[Object.keys(r)[0]])}</td><td>£${Number(r.revenue||0).toLocaleString()}</td><td>£${Number(r.target||0).toLocaleString()}</td><td>£${Number(r.profit||0).toLocaleString()}</td></tr>`).join("")}
   </table>
-  <h2>AI Analysis: ${reportTitle}</h2>
-  <div class="report-body">${reportText}</div>
+  <h2>AI Analysis: ${esc(reportTitle)}</h2>
+  <div class="report-body">${esc(reportText)}</div>
   <div class="footer">TRANQUILLOIQ ENTERPRISE · AI BUSINESS INTELLIGENCE PLATFORM · v2.4.1 · tranquilloiq.io</div>
   <br><button onclick="window.print()" style="background:#c8a96e;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;">Print / Save as PDF</button>
   </body></html>`);
@@ -286,10 +363,15 @@ export default function TranquilloIQ() {
   const handleGenerate = async (id) => {
     setGenerating(id);
     setActiveReport(id);
-    await generateAIReport(id, revenueData, deptData, (val) => {
-      setReportContent(prev => ({ ...prev, [id]: val }));
-      if (val !== "loading") setGenerating(null);
-    });
+    try {
+      // The setter fires once per streamed chunk; "generating" stays true
+      // until the stream actually closes.
+      await generateAIReport(id, revenueData, deptData, (val) => {
+        setReportContent(prev => ({ ...prev, [id]: val }));
+      });
+    } finally {
+      setGenerating(null);
+    }
     setTimeout(() => reportRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
   };
 
@@ -406,7 +488,7 @@ export default function TranquilloIQ() {
                 <div style={S.kpiAccent}>{["◈","△","◻","⬡"][i]}</div>
                 <div style={S.kpiTop}>{k.label}</div>
                 <div style={S.kpiVal}>{k.value}</div>
-                <span style={S.kpiDelta(k.up)}>{k.delta}</span>
+                {k.delta && <span style={S.kpiDelta(k.up)}>{k.delta}</span>}
                 <div style={S.kpiSub}>{k.sub}</div>
               </div>
             ))}
