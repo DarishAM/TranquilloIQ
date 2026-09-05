@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import Papa from "papaparse";
+import { buildPrompt } from "../shared/report-prompts.js";
 
 // ── Fonts ──────────────────────────────────────────────────────────────
 const fontLink = document.createElement("link");
@@ -142,28 +143,21 @@ const licenceHeaders = (licence) =>
 
 // ── AI report ──────────────────────────────────────────────────────────
 async function generateAIReport(type, revData, deptData, setter, ctx = {}) {
-  const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
-  const totalProfit = revData.reduce((s, r) => s + (Number(r.profit) || 0), 0);
-  const margin = totalRev > 0 ? ((totalProfit / totalRev) * 100).toFixed(1) : 0;
-  const avgEff = deptData.length > 0
-    ? (deptData.reduce((s, d) => s + (Number(d.efficiency) || 0), 0) / deptData.length).toFixed(0) : 0;
-  const deptSummary = deptData.map(d => `${d.dept}: efficiency ${d.efficiency}%, headcount ${d.headcount}`).join("; ");
-
-  const base = `Company data — Revenue: £${(totalRev/1000000).toFixed(2)}M, Profit margin: ${margin}%, Avg efficiency: ${avgEff}%, Departments: ${deptSummary}.`;
-
-  const prompts = {
-    exec: `You are a senior business analyst. Write a concise 4-paragraph executive summary using this data: ${base} Cover: performance highlights, strategic position, key risks, and one bold recommendation. Flowing prose only.`,
-    risk: `You are a risk intelligence officer. Write a 4-paragraph risk analysis using: ${base} Cover: financial risk, operational risk, talent/org risk, and one mitigation priority. Authoritative, no fluff.`,
-    growth: `You are a strategic growth advisor. Write a 4-paragraph growth forecast using: ${base} Forecast next 12 months, identify two expansion vectors, note market conditions, give a bold projection.`,
-    ops: `You are an operations director. Write a 4-paragraph operational audit using: ${base} Identify weakest area, commend strongest, recommend one cross-departmental initiative, end with a measurable 90-day target.`,
-  };
+  // Prompt construction is shared with the public API (api/v1/reports.js), so
+  // the dashboard and paying integrators get the same analysis from the same
+  // numbers.
+  const prompt = buildPrompt(type, revData, deptData);
+  if (!prompt) {
+    setter(`Unknown report type "${type}".`);
+    return;
+  }
 
   setter("loading");
   try {
     const res = await fetch("/api/generate-report", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...licenceHeaders(ctx.licence) },
-      body: JSON.stringify({ prompt: prompts[type] }),
+      body: JSON.stringify({ prompt }),
     });
 
     if (!res.ok) {

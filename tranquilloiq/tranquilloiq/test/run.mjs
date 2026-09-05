@@ -11,11 +11,14 @@ const env = {
   STRIPE_WEBHOOK_SECRET: "whsec_testsecret123",
   FREE_REPORTS_PER_DAY: "3",
   CREDITS_PER_PACK: "2",
+  STRIPE_PRICE_STARTER: "price_starter123",
+  STRIPE_PRICE_GROWTH: "price_growth123",
 };
 
 const suites = [
   ["test/billing.test.mjs", "http://127.0.0.1:4021"],
   ["test/refund.test.mjs", "http://127.0.0.1:4031"],
+  ["test/api-product.test.mjs", "http://127.0.0.1:4041"],
 ];
 
 let failed = 0;

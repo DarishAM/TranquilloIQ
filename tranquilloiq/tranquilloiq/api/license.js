@@ -1,5 +1,6 @@
 import { getJSON, getCredits } from "./_lib/store.js";
 import { readLicenseKey } from "./_lib/billing.js";
+import { hashKey } from "./_lib/keys.js";
 
 // Two jobs:
 //   GET /api/license?session_id=cs_...  -> hand the buyer their key after checkout
@@ -22,11 +23,11 @@ export default async function handler(req, res) {
     }
     return res.status(200).json({
       licenseKey: record.licenseKey,
-      credits: await getCredits(record.licenseKey),
+      credits: await getCredits(hashKey(record.licenseKey)),
     });
   }
 
   const licenseKey = readLicenseKey(req);
   if (!licenseKey) return res.status(400).json({ error: "No licence key." });
-  return res.status(200).json({ credits: await getCredits(licenseKey) });
+  return res.status(200).json({ credits: await getCredits(hashKey(licenseKey)) });
 }

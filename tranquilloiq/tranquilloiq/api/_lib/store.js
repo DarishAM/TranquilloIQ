@@ -107,13 +107,18 @@ export async function setJSON(key, value, ttlSeconds) {
  * Set only if the key does not already exist. Returns true when this call
  * created it — the primitive that makes webhook handling idempotent.
  */
-export async function setIfAbsent(key, value) {
+export async function setIfAbsent(key, value, ttlSeconds) {
   if (!isPersistent) {
     if (memGet(key) !== null) return false;
-    mem.set(key, { value, expires: 0 });
+    mem.set(key, {
+      value,
+      expires: ttlSeconds ? Date.now() + ttlSeconds * 1000 : 0,
+    });
     return true;
   }
-  const [res] = await pipeline([["SET", key, JSON.stringify(value), "NX"]]);
+  const cmd = ["SET", key, JSON.stringify(value), "NX"];
+  if (ttlSeconds) cmd.push("EX", ttlSeconds);
+  const [res] = await pipeline([cmd]);
   return res === "OK";
 }
 
@@ -122,8 +127,8 @@ export async function setIfAbsent(key, value) {
  * the license does not exist / has none left. DECRBY is atomic, so two
  * concurrent requests can never both spend the same last credit.
  */
-export async function spendCredit(licenseKey) {
-  const balanceKey = `credits:${licenseKey}`;
+export async function spendCredit(licenseKeyHash) {
+  const balanceKey = `credits:${licenseKeyHash}`;
   if (!isPersistent) {
     const left = Number(memGet(balanceKey) || 0);
     if (left <= 0) return null;
@@ -140,8 +145,8 @@ export async function spendCredit(licenseKey) {
   return Number(left);
 }
 
-export async function addCredits(licenseKey, amount) {
-  const balanceKey = `credits:${licenseKey}`;
+export async function addCredits(licenseKeyHash, amount) {
+  const balanceKey = `credits:${licenseKeyHash}`;
   if (!isPersistent) {
     const left = Number(memGet(balanceKey) || 0);
     mem.set(balanceKey, { value: left + amount, expires: 0 });
@@ -151,9 +156,9 @@ export async function addCredits(licenseKey, amount) {
   return Number(left);
 }
 
-export async function getCredits(licenseKey) {
+export async function getCredits(licenseKeyHash) {
   const [raw] = isPersistent
-    ? await pipeline([["GET", `credits:${licenseKey}`]])
-    : [memGet(`credits:${licenseKey}`)];
+    ? await pipeline([["GET", `credits:${licenseKeyHash}`]])
+    : [memGet(`credits:${licenseKeyHash}`)];
   return Number(raw || 0);
 }

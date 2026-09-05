@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { hashKey, mintKey, keyPattern } from "./keys.js";
 import { incr, decr, addCredits, getCredits, spendCredit, isPersistent } from "./store.js";
 
 // Sold as one-off credit packs rather than subscriptions: each report costs
@@ -9,10 +10,12 @@ export const CREDITS_PER_PACK = Number(process.env.CREDITS_PER_PACK || 100);
 
 const DAY_SECONDS = 24 * 60 * 60;
 
+export const LICENCE_PREFIX = "tqiq";
+
 export function mintLicenseKey() {
   // 32 bytes of CSPRNG output — not guessable, and never derived from the
   // Stripe session id or the buyer's email.
-  return `tqiq_${crypto.randomBytes(32).toString("hex")}`;
+  return mintKey(LICENCE_PREFIX);
 }
 
 /** Constant-time compare, for any place we check a secret against user input. */
@@ -35,7 +38,7 @@ export function readLicenseKey(req) {
   if (typeof key !== "string") return null;
   const trimmed = key.trim();
   // Shape check before it ever reaches the store, so junk never becomes a lookup.
-  return /^tqiq_[0-9a-f]{64}$/.test(trimmed) ? trimmed : null;
+  return keyPattern(LICENCE_PREFIX).test(trimmed) ? trimmed : null;
 }
 
 /**
@@ -49,9 +52,9 @@ export async function authorizeReport(req) {
   const license = readLicenseKey(req);
 
   if (license) {
-    const remaining = await spendCredit(license);
+    const remaining = await spendCredit(hashKey(license));
     if (remaining === null) {
-      const balance = await getCredits(license);
+      const balance = await getCredits(hashKey(license));
       return {
         ok: false,
         status: 402,
@@ -88,7 +91,7 @@ export async function authorizeReport(req) {
 export async function refundReport(req) {
   const license = readLicenseKey(req);
   if (license) {
-    await addCredits(license, 1);
+    await addCredits(hashKey(license), 1);
     return;
   }
   const day = new Date().toISOString().slice(0, 10);
