@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, Line } from "recharts";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import Papa from "papaparse";
+import { buildPrompt } from "../shared/report-prompts.js";
 
 // ── Fonts ──────────────────────────────────────────────────────────────
 const fontLink = document.createElement("link");
@@ -46,63 +47,168 @@ const CSV_TEMPLATES = {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────
+const fmtGBP = (n) =>
+  n >= 1000000 ? `£${(n / 1000000).toFixed(2)}M`
+  : n >= 1000 ? `£${(n / 1000).toFixed(0)}k`
+  : `£${Math.round(n)}`;
+
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+// Percentage change between the two most recent periods, or null when the
+// data has no second period to compare against. Deltas are only ever shown
+// when they were actually measured — never assumed.
+function periodDelta(rows, key) {
+  if (rows.length < 2) return null;
+  const prev = num(rows[rows.length - 2][key]);
+  const curr = num(rows[rows.length - 1][key]);
+  if (prev === 0) return null;
+  const pct = ((curr - prev) / Math.abs(prev)) * 100;
+  return { delta: `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`, up: pct >= 0 };
+}
+
 function calcKPIs(revData, deptData) {
-  const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
-  const totalProfit = revData.reduce((s, r) => s + (Number(r.profit) || 0), 0);
+  const totalRev = revData.reduce((s, r) => s + num(r.revenue), 0);
+  const totalProfit = revData.reduce((s, r) => s + num(r.profit), 0);
   const margin = totalRev > 0 ? ((totalProfit / totalRev) * 100).toFixed(1) : "0.0";
-  const totalCost = deptData.reduce((s, d) => s + (Number(d.cost) || 0), 0);
-  const avgEff = deptData.length > 0
-    ? (deptData.reduce((s, d) => s + (Number(d.efficiency) || 0), 0) / deptData.length).toFixed(0)
-    : "0";
-  const fmt = (n) => n >= 1000000 ? `£${(n / 1000000).toFixed(2)}M` : n >= 1000 ? `£${(n / 1000).toFixed(0)}k` : `£${n}`;
+  const totalCost = deptData.reduce((s, d) => s + num(d.cost), 0);
+  const totalHeads = deptData.reduce((s, d) => s + num(d.headcount), 0);
+  const effs = deptData.map((d) => num(d.efficiency));
+  const avgEff = effs.length ? Math.round(effs.reduce((s, e) => s + e, 0) / effs.length) : 0;
+
+  const revDelta = periodDelta(revData, "revenue");
+
+  // Margin moves in percentage points, not percent — compare the last two periods.
+  let marginDelta = null;
+  if (revData.length >= 2) {
+    const [a, b] = revData.slice(-2);
+    const mA = num(a.revenue) ? (num(a.profit) / num(a.revenue)) * 100 : null;
+    const mB = num(b.revenue) ? (num(b.profit) / num(b.revenue)) * 100 : null;
+    if (mA !== null && mB !== null) {
+      const pp = mB - mA;
+      marginDelta = { delta: `${pp >= 0 ? "+" : ""}${pp.toFixed(1)}pp`, up: pp >= 0 };
+    }
+  }
+
+  const last = revData[revData.length - 1];
+  const period = last ? String(last.month ?? last[Object.keys(last)[0]] ?? "latest") : "latest";
+  const costPerHead = totalHeads > 0 ? (totalCost * 1000000) / totalHeads : 0;
+
   return [
-    { label: "Total Revenue", value: fmt(totalRev), delta: "+18.4%", up: true, sub: "from uploaded data" },
-    { label: "Net Profit Margin", value: `${margin}%`, delta: "+4.1pp", up: true, sub: "industry avg 22%" },
-    { label: "Dept Operating Cost", value: `£${totalCost.toFixed(1)}M`, delta: "-3.2%", up: true, sub: "combined dept cost" },
-    { label: "Avg Efficiency", value: `${avgEff}%`, delta: "+9pts", up: Number(avgEff) >= 80, sub: "across all depts" },
+    {
+      label: "Total Revenue", value: fmtGBP(totalRev),
+      ...(revDelta || {}),
+      sub: revDelta ? `${period} vs prior period` : `${revData.length} period${revData.length === 1 ? "" : "s"}`,
+    },
+    {
+      label: "Net Profit Margin", value: `${margin}%`,
+      ...(marginDelta || {}),
+      sub: marginDelta ? `${period} vs prior period` : "across all periods",
+    },
+    {
+      label: "Dept Operating Cost", value: `£${totalCost.toFixed(1)}M`,
+      sub: totalHeads > 0 ? `${fmtGBP(costPerHead)} per head · ${totalHeads} staff` : `${deptData.length} departments`,
+    },
+    {
+      label: "Avg Efficiency", value: `${avgEff}%`,
+      sub: effs.length ? `range ${Math.min(...effs)}%–${Math.max(...effs)}% across ${effs.length} depts` : "no department data",
+    },
   ];
 }
 
+// ── Licence ────────────────────────────────────────────────────────────
+// The key is a bearer credential: whoever holds it can spend its credits.
+// It lives in localStorage so a returning visitor keeps their balance, and is
+// sent as a header — never in a URL, where it would leak via referrers and logs.
+const LICENCE_STORAGE_KEY = "tranquilloiq.licence";
+
+const loadLicence = () => {
+  try {
+    return localStorage.getItem(LICENCE_STORAGE_KEY) || "";
+  } catch {
+    return ""; // private browsing / storage disabled
+  }
+};
+
+const saveLicence = (key) => {
+  try {
+    if (key) localStorage.setItem(LICENCE_STORAGE_KEY, key);
+    else localStorage.removeItem(LICENCE_STORAGE_KEY);
+  } catch {
+    /* not fatal — the key just will not persist across reloads */
+  }
+};
+
+const licenceHeaders = (licence) =>
+  licence ? { "X-License-Key": licence } : {};
+
 // ── AI report ──────────────────────────────────────────────────────────
-async function generateAIReport(type, revData, deptData, setter) {
-  const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
-  const totalProfit = revData.reduce((s, r) => s + (Number(r.profit) || 0), 0);
-  const margin = totalRev > 0 ? ((totalProfit / totalRev) * 100).toFixed(1) : 0;
-  const avgEff = deptData.length > 0
-    ? (deptData.reduce((s, d) => s + (Number(d.efficiency) || 0), 0) / deptData.length).toFixed(0) : 0;
-  const deptSummary = deptData.map(d => `${d.dept}: efficiency ${d.efficiency}%, headcount ${d.headcount}`).join("; ");
-
-  const base = `Company data — Revenue: £${(totalRev/1000000).toFixed(2)}M, Profit margin: ${margin}%, Avg efficiency: ${avgEff}%, Departments: ${deptSummary}.`;
-
-  const prompts = {
-    exec: `You are a senior business analyst. Write a concise 4-paragraph executive summary using this data: ${base} Cover: performance highlights, strategic position, key risks, and one bold recommendation. Flowing prose only.`,
-    risk: `You are a risk intelligence officer. Write a 4-paragraph risk analysis using: ${base} Cover: financial risk, operational risk, talent/org risk, and one mitigation priority. Authoritative, no fluff.`,
-    growth: `You are a strategic growth advisor. Write a 4-paragraph growth forecast using: ${base} Forecast next 12 months, identify two expansion vectors, note market conditions, give a bold projection.`,
-    ops: `You are an operations director. Write a 4-paragraph operational audit using: ${base} Identify weakest area, commend strongest, recommend one cross-departmental initiative, end with a measurable 90-day target.`,
-  };
+async function generateAIReport(type, revData, deptData, setter, ctx = {}) {
+  // Prompt construction is shared with the public API (api/v1/reports.js), so
+  // the dashboard and paying integrators get the same analysis from the same
+  // numbers.
+  const prompt = buildPrompt(type, revData, deptData);
+  if (!prompt) {
+    setter(`Unknown report type "${type}".`);
+    return;
+  }
 
   setter("loading");
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch("/api/generate-report", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: prompts[type] }],
-      }),
+      headers: { "Content-Type": "application/json", ...licenceHeaders(ctx.licence) },
+      body: JSON.stringify({ prompt }),
     });
-    const data = await res.json();
-    setter(data.content?.find(b => b.type === "text")?.text || "Unable to generate.");
-  } catch {
-    setter("Error generating report. Please try again.");
+
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null);
+      // 402 is the paywall: out of free reports, or out of credits.
+      if (res.status === 402) {
+        ctx.onOutOfCredit?.(detail?.error || "Out of report credits.");
+        setter("");
+        return;
+      }
+      setter(`Could not generate this report. ${detail?.error || `Server returned ${res.status}.`}`);
+      return;
+    }
+
+    const remaining = res.headers.get("X-Reports-Remaining");
+    if (remaining !== null) ctx.onRemaining?.(Number(remaining));
+
+    // The endpoint streams plain text — paint it as it arrives.
+    const reader = res.body?.getReader();
+    if (!reader) {
+      setter((await res.text()) || "Unable to generate.");
+      return;
+    }
+    const decoder = new TextDecoder();
+    let out = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += decoder.decode(value, { stream: true });
+      setter(out);
+    }
+    out += decoder.decode();
+    setter(out.trim() || "Unable to generate.");
+  } catch (err) {
+    setter(`Error generating report: ${err.message || "network failure"}. Please try again.`);
   }
 }
 
 // ── PDF Export ─────────────────────────────────────────────────────────
+// Report text and CSV cells are user/model supplied, so everything
+// interpolated into the print window gets escaped.
+const esc = (v) =>
+  String(v ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
 function exportPDF(reportTitle, reportText, kpis, revData) {
   const win = window.open("", "_blank");
-  const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+  if (!win) {
+    alert("Your browser blocked the report window. Allow pop-ups for this site and try again.");
+    return;
+  }
   win.document.write(`<!DOCTYPE html><html><head><title>TranquilloIQ Report</title>
   <style>
     body { font-family: Georgia, serif; max-width: 720px; margin: 40px auto; color: #1a1a2e; line-height: 1.8; }
@@ -120,19 +226,19 @@ function exportPDF(reportTitle, reportText, kpis, revData) {
     .footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid #ddd; font-size: 11px; color: #aaa; font-family: monospace; }
     @media print { button { display: none; } }
   </style></head><body>
-  <h1>TranquilloIQ · ${reportTitle}</h1>
+  <h1>TranquilloIQ · ${esc(reportTitle)}</h1>
   <div class="meta">Generated ${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })} · TranquilloIQ AI Engine · Confidential</div>
   <h2>Key Performance Indicators</h2>
   <div class="kpi-grid">
-    ${kpis.map(k => `<div class="kpi"><div class="kpi-val">${k.value}</div><div class="kpi-label">${k.label} <span style="color:${k.up?"#4caf7d":"#e05a5a"}">${k.delta}</span></div></div>`).join("")}
+    ${kpis.map(k => `<div class="kpi"><div class="kpi-val">${esc(k.value)}</div><div class="kpi-label">${esc(k.label)}${k.delta ? ` <span style="color:${k.up ? "#4caf7d" : "#e05a5a"}">${esc(k.delta)}</span>` : ""}</div><div class="kpi-label">${esc(k.sub)}</div></div>`).join("")}
   </div>
   <h2>Revenue Data</h2>
   <table class="table">
     <tr><th>Period</th><th>Revenue</th><th>Target</th><th>Profit</th></tr>
-    ${revData.slice(0,12).map(r => `<tr><td>${r.month||r[Object.keys(r)[0]]}</td><td>£${Number(r.revenue||0).toLocaleString()}</td><td>£${Number(r.target||0).toLocaleString()}</td><td>£${Number(r.profit||0).toLocaleString()}</td></tr>`).join("")}
+    ${revData.slice(0,12).map(r => `<tr><td>${esc(r.month ?? r[Object.keys(r)[0]])}</td><td>£${Number(r.revenue||0).toLocaleString()}</td><td>£${Number(r.target||0).toLocaleString()}</td><td>£${Number(r.profit||0).toLocaleString()}</td></tr>`).join("")}
   </table>
-  <h2>AI Analysis: ${reportTitle}</h2>
-  <div class="report-body">${reportText}</div>
+  <h2>AI Analysis: ${esc(reportTitle)}</h2>
+  <div class="report-body">${esc(reportText)}</div>
   <div class="footer">TRANQUILLOIQ ENTERPRISE · AI BUSINESS INTELLIGENCE PLATFORM · v2.4.1 · tranquilloiq.io</div>
   <br><button onclick="window.print()" style="background:#c8a96e;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;">Print / Save as PDF</button>
   </body></html>`);
@@ -255,6 +361,105 @@ function CSVModal({ onClose, onUpload }) {
   );
 }
 
+// ── Paywall ────────────────────────────────────────────────────────────
+function PaywallModal({ reason, licence, onClose, onLicence }) {
+  const [keyInput, setKeyInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const startCheckout = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/checkout", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.url) {
+        setError(data?.error || `Could not start checkout (${res.status}).`);
+        setBusy(false);
+        return;
+      }
+      window.location.href = data.url; // hand off to Stripe
+    } catch (err) {
+      setError(err.message || "Network error starting checkout.");
+      setBusy(false);
+    }
+  };
+
+  const applyKey = async () => {
+    const key = keyInput.trim();
+    if (!/^tqiq_[0-9a-f]{64}$/.test(key)) {
+      setError("That does not look like a licence key.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/license", { headers: { "X-License-Key": key } });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setError(data?.error || "Could not verify that key.");
+        setBusy(false);
+        return;
+      }
+      if (!data.credits) {
+        setError("That licence has no credits left.");
+        setBusy(false);
+        return;
+      }
+      onLicence(key, data.credits);
+      onClose();
+    } catch (err) {
+      setError(err.message || "Network error verifying key.");
+      setBusy(false);
+    }
+  };
+
+  const s = {
+    overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 120 },
+    box: { background: "#0e1117", border: "1px solid #2a2f3e", borderRadius: 14, padding: 32, width: 460, maxWidth: "90vw" },
+    title: { fontSize: 16, fontWeight: 700, color: "#e8eaf2", marginBottom: 6 },
+    reason: { fontSize: 12, color: "#e0a45a", fontFamily: "DM Mono", lineHeight: 1.6, marginBottom: 22 },
+    buy: { width: "100%", background: "linear-gradient(135deg,#c8a96e,#8b6f3e)", border: "none", borderRadius: 8, padding: "13px 18px", fontSize: 13, fontWeight: 700, color: "#080b10", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 },
+    or: { textAlign: "center", fontSize: 10, color: "#3a4050", fontFamily: "DM Mono", letterSpacing: "0.1em", margin: "18px 0 14px" },
+    label: { fontSize: 11, color: "#8b92a5", fontFamily: "DM Mono", marginBottom: 7, display: "block" },
+    input: { width: "100%", background: "#080b10", border: "1px solid #2a2f3e", borderRadius: 6, padding: "9px 12px", fontSize: 11, fontFamily: "DM Mono", color: "#e8eaf2" },
+    row: { display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 16 },
+    ghost: { background: "transparent", border: "1px solid #2a2f3e", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontFamily: "DM Mono", color: "#8b92a5", cursor: "pointer" },
+    apply: { background: "rgba(200,169,110,0.12)", border: "1px solid rgba(200,169,110,0.35)", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontFamily: "DM Mono", color: "#c8a96e", cursor: "pointer" },
+    error: { color: "#e05a5a", fontSize: 11, fontFamily: "DM Mono", marginTop: 12 },
+  };
+
+  return (
+    <div style={s.overlay} onClick={onClose}>
+      <div style={s.box} onClick={(e) => e.stopPropagation()}>
+        <div style={s.title}>Out of report credits</div>
+        <div style={s.reason}>{reason}</div>
+        <button style={s.buy} onClick={startCheckout} disabled={busy}>
+          {busy ? "Opening checkout…" : "Buy a credit pack →"}
+        </button>
+        <div style={s.or}>OR ENTER AN EXISTING KEY</div>
+        <label style={s.label} htmlFor="licence-key">Licence key</label>
+        <input
+          id="licence-key" style={s.input} value={keyInput}
+          placeholder="tqiq_…" autoComplete="off" spellCheck={false}
+          onChange={(e) => setKeyInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && applyKey()}
+        />
+        {error && <div style={s.error}>⚠ {error}</div>}
+        <div style={s.row}>
+          <button style={s.ghost} onClick={onClose}>Close</button>
+          <button style={s.apply} onClick={applyKey} disabled={busy}>Apply key</button>
+        </div>
+        {licence && (
+          <div style={{ ...s.or, marginBottom: 0 }}>
+            CURRENT KEY …{licence.slice(-8)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Main App ───────────────────────────────────────────────────────────
 export default function TranquilloIQ() {
   const [revenueData, setRevenueData] = useState(DEFAULT_REVENUE);
@@ -267,7 +472,62 @@ export default function TranquilloIQ() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showCSV, setShowCSV] = useState(false);
   const [dataSource, setDataSource] = useState("demo");
+  const [licence, setLicence] = useState(loadLicence);
+  const [credits, setCredits] = useState(null);
+  const [paywall, setPaywall] = useState(null);
   const reportRef = useRef(null);
+
+  // Returning from Stripe: swap the checkout session for a licence key. The
+  // webhook that mints the key races the browser redirect, so poll briefly
+  // rather than failing on the first 404.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("checkout") !== "success") return;
+    const sessionId = params.get("session_id");
+    // Clear the query string either way so a refresh cannot re-trigger this.
+    window.history.replaceState({}, "", window.location.pathname);
+    if (!sessionId) return;
+
+    let cancelled = false;
+    (async () => {
+      for (let attempt = 0; attempt < 10 && !cancelled; attempt++) {
+        try {
+          const res = await fetch(
+            `/api/license?session_id=${encodeURIComponent(sessionId)}`,
+          );
+          if (res.ok) {
+            const data = await res.json();
+            if (cancelled) return;
+            saveLicence(data.licenseKey);
+            setLicence(data.licenseKey);
+            setCredits(data.credits);
+            return;
+          }
+        } catch {
+          /* keep retrying */
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      if (!cancelled) {
+        setPaywall(
+          "Payment went through, but the licence key has not arrived yet. " +
+            "Reload in a moment, or paste the key from your receipt email.",
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Keep the displayed balance honest on load for an already-saved key.
+  useEffect(() => {
+    if (!licence) return;
+    fetch("/api/license", { headers: { "X-License-Key": licence } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => d && setCredits(d.credits))
+      .catch(() => {});
+  }, [licence]);
 
   const handleUpload = (type, rows) => {
     if (type === "revenue") {
@@ -286,10 +546,27 @@ export default function TranquilloIQ() {
   const handleGenerate = async (id) => {
     setGenerating(id);
     setActiveReport(id);
-    await generateAIReport(id, revenueData, deptData, (val) => {
-      setReportContent(prev => ({ ...prev, [id]: val }));
-      if (val !== "loading") setGenerating(null);
-    });
+    try {
+      // The setter fires once per streamed chunk; "generating" stays true
+      // until the stream actually closes.
+      await generateAIReport(
+        id,
+        revenueData,
+        deptData,
+        (val) => setReportContent(prev => ({ ...prev, [id]: val })),
+        {
+          licence,
+          onOutOfCredit: (reason) => {
+            setPaywall(reason);
+            setActiveReport(null);
+            setCredits(0);
+          },
+          onRemaining: (n) => setCredits(n),
+        },
+      );
+    } finally {
+      setGenerating(null);
+    }
     setTimeout(() => reportRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
   };
 
@@ -356,6 +633,18 @@ export default function TranquilloIQ() {
       `}</style>
 
       {showCSV && <CSVModal onClose={() => setShowCSV(false)} onUpload={handleUpload} />}
+      {paywall && (
+        <PaywallModal
+          reason={paywall}
+          licence={licence}
+          onClose={() => setPaywall(null)}
+          onLicence={(key, balance) => {
+            saveLicence(key);
+            setLicence(key);
+            setCredits(balance);
+          }}
+        />
+      )}
 
       {/* Sidebar */}
       <div style={S.sidebar}>
@@ -392,6 +681,17 @@ export default function TranquilloIQ() {
             <span style={dataSource === "uploaded" ? S.badgeLive : S.badge}>
               {dataSource === "uploaded" ? "● Live Data" : "◌ Demo Data"}
             </span>
+            <button
+              style={{ ...S.badge, cursor: "pointer", fontFamily: "DM Mono" }}
+              onClick={() => setPaywall(licence
+                ? "Top up this licence with another credit pack."
+                : "Buy a credit pack for unmetered reports, or apply an existing key.")}
+              title={licence ? `Licence …${licence.slice(-8)}` : "Free tier"}
+            >
+              {credits === null
+                ? (licence ? "◆ Licensed" : "◆ Free tier")
+                : `◆ ${credits} report${credits === 1 ? "" : "s"} left`}
+            </button>
             <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg,#c8a96e,#5a3e1b)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#080b10" }}>A</div>
           </div>
         </div>
@@ -406,7 +706,7 @@ export default function TranquilloIQ() {
                 <div style={S.kpiAccent}>{["◈","△","◻","⬡"][i]}</div>
                 <div style={S.kpiTop}>{k.label}</div>
                 <div style={S.kpiVal}>{k.value}</div>
-                <span style={S.kpiDelta(k.up)}>{k.delta}</span>
+                {k.delta && <span style={S.kpiDelta(k.up)}>{k.delta}</span>}
                 <div style={S.kpiSub}>{k.sub}</div>
               </div>
             ))}
