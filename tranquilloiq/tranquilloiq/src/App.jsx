@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import Papa from "papaparse";
 
@@ -114,8 +114,34 @@ function calcKPIs(revData, deptData) {
   ];
 }
 
+// ── Licence ────────────────────────────────────────────────────────────
+// The key is a bearer credential: whoever holds it can spend its credits.
+// It lives in localStorage so a returning visitor keeps their balance, and is
+// sent as a header — never in a URL, where it would leak via referrers and logs.
+const LICENCE_STORAGE_KEY = "tranquilloiq.licence";
+
+const loadLicence = () => {
+  try {
+    return localStorage.getItem(LICENCE_STORAGE_KEY) || "";
+  } catch {
+    return ""; // private browsing / storage disabled
+  }
+};
+
+const saveLicence = (key) => {
+  try {
+    if (key) localStorage.setItem(LICENCE_STORAGE_KEY, key);
+    else localStorage.removeItem(LICENCE_STORAGE_KEY);
+  } catch {
+    /* not fatal — the key just will not persist across reloads */
+  }
+};
+
+const licenceHeaders = (licence) =>
+  licence ? { "X-License-Key": licence } : {};
+
 // ── AI report ──────────────────────────────────────────────────────────
-async function generateAIReport(type, revData, deptData, setter) {
+async function generateAIReport(type, revData, deptData, setter, ctx = {}) {
   const totalRev = revData.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
   const totalProfit = revData.reduce((s, r) => s + (Number(r.profit) || 0), 0);
   const margin = totalRev > 0 ? ((totalProfit / totalRev) * 100).toFixed(1) : 0;
@@ -136,15 +162,24 @@ async function generateAIReport(type, revData, deptData, setter) {
   try {
     const res = await fetch("/api/generate-report", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...licenceHeaders(ctx.licence) },
       body: JSON.stringify({ prompt: prompts[type] }),
     });
 
     if (!res.ok) {
       const detail = await res.json().catch(() => null);
+      // 402 is the paywall: out of free reports, or out of credits.
+      if (res.status === 402) {
+        ctx.onOutOfCredit?.(detail?.error || "Out of report credits.");
+        setter("");
+        return;
+      }
       setter(`Could not generate this report. ${detail?.error || `Server returned ${res.status}.`}`);
       return;
     }
+
+    const remaining = res.headers.get("X-Reports-Remaining");
+    if (remaining !== null) ctx.onRemaining?.(Number(remaining));
 
     // The endpoint streams plain text — paint it as it arrives.
     const reader = res.body?.getReader();
@@ -332,6 +367,105 @@ function CSVModal({ onClose, onUpload }) {
   );
 }
 
+// ── Paywall ────────────────────────────────────────────────────────────
+function PaywallModal({ reason, licence, onClose, onLicence }) {
+  const [keyInput, setKeyInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const startCheckout = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/checkout", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.url) {
+        setError(data?.error || `Could not start checkout (${res.status}).`);
+        setBusy(false);
+        return;
+      }
+      window.location.href = data.url; // hand off to Stripe
+    } catch (err) {
+      setError(err.message || "Network error starting checkout.");
+      setBusy(false);
+    }
+  };
+
+  const applyKey = async () => {
+    const key = keyInput.trim();
+    if (!/^tqiq_[0-9a-f]{64}$/.test(key)) {
+      setError("That does not look like a licence key.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/license", { headers: { "X-License-Key": key } });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setError(data?.error || "Could not verify that key.");
+        setBusy(false);
+        return;
+      }
+      if (!data.credits) {
+        setError("That licence has no credits left.");
+        setBusy(false);
+        return;
+      }
+      onLicence(key, data.credits);
+      onClose();
+    } catch (err) {
+      setError(err.message || "Network error verifying key.");
+      setBusy(false);
+    }
+  };
+
+  const s = {
+    overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 120 },
+    box: { background: "#0e1117", border: "1px solid #2a2f3e", borderRadius: 14, padding: 32, width: 460, maxWidth: "90vw" },
+    title: { fontSize: 16, fontWeight: 700, color: "#e8eaf2", marginBottom: 6 },
+    reason: { fontSize: 12, color: "#e0a45a", fontFamily: "DM Mono", lineHeight: 1.6, marginBottom: 22 },
+    buy: { width: "100%", background: "linear-gradient(135deg,#c8a96e,#8b6f3e)", border: "none", borderRadius: 8, padding: "13px 18px", fontSize: 13, fontWeight: 700, color: "#080b10", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 },
+    or: { textAlign: "center", fontSize: 10, color: "#3a4050", fontFamily: "DM Mono", letterSpacing: "0.1em", margin: "18px 0 14px" },
+    label: { fontSize: 11, color: "#8b92a5", fontFamily: "DM Mono", marginBottom: 7, display: "block" },
+    input: { width: "100%", background: "#080b10", border: "1px solid #2a2f3e", borderRadius: 6, padding: "9px 12px", fontSize: 11, fontFamily: "DM Mono", color: "#e8eaf2" },
+    row: { display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 16 },
+    ghost: { background: "transparent", border: "1px solid #2a2f3e", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontFamily: "DM Mono", color: "#8b92a5", cursor: "pointer" },
+    apply: { background: "rgba(200,169,110,0.12)", border: "1px solid rgba(200,169,110,0.35)", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontFamily: "DM Mono", color: "#c8a96e", cursor: "pointer" },
+    error: { color: "#e05a5a", fontSize: 11, fontFamily: "DM Mono", marginTop: 12 },
+  };
+
+  return (
+    <div style={s.overlay} onClick={onClose}>
+      <div style={s.box} onClick={(e) => e.stopPropagation()}>
+        <div style={s.title}>Out of report credits</div>
+        <div style={s.reason}>{reason}</div>
+        <button style={s.buy} onClick={startCheckout} disabled={busy}>
+          {busy ? "Opening checkout…" : "Buy a credit pack →"}
+        </button>
+        <div style={s.or}>OR ENTER AN EXISTING KEY</div>
+        <label style={s.label} htmlFor="licence-key">Licence key</label>
+        <input
+          id="licence-key" style={s.input} value={keyInput}
+          placeholder="tqiq_…" autoComplete="off" spellCheck={false}
+          onChange={(e) => setKeyInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && applyKey()}
+        />
+        {error && <div style={s.error}>⚠ {error}</div>}
+        <div style={s.row}>
+          <button style={s.ghost} onClick={onClose}>Close</button>
+          <button style={s.apply} onClick={applyKey} disabled={busy}>Apply key</button>
+        </div>
+        {licence && (
+          <div style={{ ...s.or, marginBottom: 0 }}>
+            CURRENT KEY …{licence.slice(-8)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Main App ───────────────────────────────────────────────────────────
 export default function TranquilloIQ() {
   const [revenueData, setRevenueData] = useState(DEFAULT_REVENUE);
@@ -344,7 +478,62 @@ export default function TranquilloIQ() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showCSV, setShowCSV] = useState(false);
   const [dataSource, setDataSource] = useState("demo");
+  const [licence, setLicence] = useState(loadLicence);
+  const [credits, setCredits] = useState(null);
+  const [paywall, setPaywall] = useState(null);
   const reportRef = useRef(null);
+
+  // Returning from Stripe: swap the checkout session for a licence key. The
+  // webhook that mints the key races the browser redirect, so poll briefly
+  // rather than failing on the first 404.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("checkout") !== "success") return;
+    const sessionId = params.get("session_id");
+    // Clear the query string either way so a refresh cannot re-trigger this.
+    window.history.replaceState({}, "", window.location.pathname);
+    if (!sessionId) return;
+
+    let cancelled = false;
+    (async () => {
+      for (let attempt = 0; attempt < 10 && !cancelled; attempt++) {
+        try {
+          const res = await fetch(
+            `/api/license?session_id=${encodeURIComponent(sessionId)}`,
+          );
+          if (res.ok) {
+            const data = await res.json();
+            if (cancelled) return;
+            saveLicence(data.licenseKey);
+            setLicence(data.licenseKey);
+            setCredits(data.credits);
+            return;
+          }
+        } catch {
+          /* keep retrying */
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      if (!cancelled) {
+        setPaywall(
+          "Payment went through, but the licence key has not arrived yet. " +
+            "Reload in a moment, or paste the key from your receipt email.",
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Keep the displayed balance honest on load for an already-saved key.
+  useEffect(() => {
+    if (!licence) return;
+    fetch("/api/license", { headers: { "X-License-Key": licence } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => d && setCredits(d.credits))
+      .catch(() => {});
+  }, [licence]);
 
   const handleUpload = (type, rows) => {
     if (type === "revenue") {
@@ -366,9 +555,21 @@ export default function TranquilloIQ() {
     try {
       // The setter fires once per streamed chunk; "generating" stays true
       // until the stream actually closes.
-      await generateAIReport(id, revenueData, deptData, (val) => {
-        setReportContent(prev => ({ ...prev, [id]: val }));
-      });
+      await generateAIReport(
+        id,
+        revenueData,
+        deptData,
+        (val) => setReportContent(prev => ({ ...prev, [id]: val })),
+        {
+          licence,
+          onOutOfCredit: (reason) => {
+            setPaywall(reason);
+            setActiveReport(null);
+            setCredits(0);
+          },
+          onRemaining: (n) => setCredits(n),
+        },
+      );
     } finally {
       setGenerating(null);
     }
@@ -438,6 +639,18 @@ export default function TranquilloIQ() {
       `}</style>
 
       {showCSV && <CSVModal onClose={() => setShowCSV(false)} onUpload={handleUpload} />}
+      {paywall && (
+        <PaywallModal
+          reason={paywall}
+          licence={licence}
+          onClose={() => setPaywall(null)}
+          onLicence={(key, balance) => {
+            saveLicence(key);
+            setLicence(key);
+            setCredits(balance);
+          }}
+        />
+      )}
 
       {/* Sidebar */}
       <div style={S.sidebar}>
@@ -474,6 +687,17 @@ export default function TranquilloIQ() {
             <span style={dataSource === "uploaded" ? S.badgeLive : S.badge}>
               {dataSource === "uploaded" ? "● Live Data" : "◌ Demo Data"}
             </span>
+            <button
+              style={{ ...S.badge, cursor: "pointer", fontFamily: "DM Mono" }}
+              onClick={() => setPaywall(licence
+                ? "Top up this licence with another credit pack."
+                : "Buy a credit pack for unmetered reports, or apply an existing key.")}
+              title={licence ? `Licence …${licence.slice(-8)}` : "Free tier"}
+            >
+              {credits === null
+                ? (licence ? "◆ Licensed" : "◆ Free tier")
+                : `◆ ${credits} report${credits === 1 ? "" : "s"} left`}
+            </button>
             <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg,#c8a96e,#5a3e1b)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#080b10" }}>A</div>
           </div>
         </div>

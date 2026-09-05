@@ -1,4 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
+import {
+  authorizeReport,
+  refundReport,
+  meteringIsReliable,
+} from "./_lib/billing.js";
 
 // Streaming keeps the first byte early, so the request never trips a
 // function timeout while Claude is still writing.
@@ -31,6 +36,26 @@ export default async function handler(req, res) {
   if (prompt.length > 8000) {
     return res.status(413).json({ error: "Prompt too large." });
   }
+
+  // Without a shared store, per-instance counters would let anyone bypass the
+  // limit by hitting a cold instance. Refuse rather than silently serve for
+  // free — this endpoint spends real money on every call.
+  if (!meteringIsReliable() && process.env.VERCEL) {
+    return res.status(503).json({
+      error:
+        "Usage metering is not configured (UPSTASH_REDIS_REST_URL / _TOKEN). " +
+        "Refusing to run un-metered billable requests.",
+    });
+  }
+
+  const quota = await authorizeReport(req);
+  if (!quota.ok) {
+    return res
+      .status(quota.status)
+      .json({ error: quota.reason, remaining: 0, paid: quota.paid });
+  }
+
+  res.setHeader("X-Reports-Remaining", String(quota.remaining));
 
   let sentAnything = false;
   try {
@@ -70,6 +95,11 @@ export default async function handler(req, res) {
     return res.end();
   } catch (error) {
     console.error("generate-report failed:", error);
+    // The user's quota was consumed before the call; the call failed, so give
+    // it back. A partially streamed report is still a delivered report.
+    if (!sentAnything) {
+      await refundReport(req).catch((e) => console.error("refund failed:", e));
+    }
     const status = error?.status ?? 500;
     const message =
       status === 401
